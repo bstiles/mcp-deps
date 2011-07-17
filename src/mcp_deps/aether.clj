@@ -17,7 +17,8 @@
                                          TransferEvent)
            (org.sonatype.aether.util.artifact DefaultArtifact)
            (org.sonatype.aether.util.graph PreorderNodeListGenerator))
-  (:require [clojure.java.io :as io]))
+  (:require [clojure.java.io :as io]
+            [clojure.string :as string]))
 
 (defn make-transfer-listener
   []
@@ -54,11 +55,22 @@
 
 (defn default-local-repository
   []
-  (io/file (System/getProperty "user.home") ".m2" "repository"))
+  (if-let [override (System/getProperty "aether.localRepository")]
+    (io/file override)
+    (io/file (System/getProperty "user.home") ".m2" "repository")))
 
-(defn default-remote-repository
+(defn default-remote-repositories
   []
-  "http://repo2.maven.org/maven2/")
+  (map-indexed #(if (= 1 (count %2))
+                  [(format "central-%s" %1) (first %2)]
+                  %2)
+               (map #(string/split % #",")
+                    (concat ["central,http://repo2.maven.org/maven2/"
+                             "clojars,http://clojars.org/repo/"]
+                            (if-let [remote (System/getProperty
+                                             "aether.remoteRepository")]
+                              [remote]
+                              nil)))))
 
 (defn resolve-runtime-artifacts
   "Resolves a list of runtime artifacts from the specified repository.
@@ -77,8 +89,9 @@
      :classpath \"Platform specific classpath\"}
 "
   [artifacts & opts]
-  (let [opts (merge {:repositories [(default-remote-repository)]
-                     :local-repository (default-local-repository)}
+  (let [opts (merge {:repositories (default-remote-repositories)
+                     :local-repository (default-local-repository)
+                     :offline false}
                     (apply hash-map opts))
         repo-system (->
                      (doto (DefaultServiceLocator.)
@@ -103,7 +116,8 @@
                          (LocalRepository.
                           (:local-repository opts))))
                        (.setTransferListener (make-transfer-listener))
-                       (.setRepositoryListener (make-repository-listener)))
+                       (.setRepositoryListener (make-repository-listener))
+                       (.setOffline (:offline opts)))
         generator (PreorderNodeListGenerator.)
         root-node (doto (.getRoot
                          (.collectDependencies
@@ -120,9 +134,9 @@
                                               version)
                                             "runtime")))
                             (.setRepositories
-                             (for [location (:repositories opts)]
+                             (for [[id location] (:repositories opts)]
                                (RemoteRepository.
-                                "central"
+                                id
                                 "default"
                                 location))))))
                     (.accept generator))]
