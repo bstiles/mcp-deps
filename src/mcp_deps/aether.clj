@@ -12,10 +12,14 @@
            (org.sonatype.aether.graph Dependency)
            (org.sonatype.aether.repository LocalRepository
                                            RemoteRepository)
+           (org.sonatype.aether.resolution ArtifactRequest
+                                           ArtifactResolutionException
+                                           DependencyRequest)
            (org.sonatype.aether.spi.connector RepositoryConnectorFactory)
            (org.sonatype.aether.transfer TransferListener
                                          TransferEvent)
-           (org.sonatype.aether.util.artifact DefaultArtifact)
+           (org.sonatype.aether.util.artifact DefaultArtifact
+                                              SubArtifact)
            (org.sonatype.aether.util.graph PreorderNodeListGenerator))
   (:require [clojure.java.io :as io]
             [clojure.string :as string]))
@@ -72,6 +76,13 @@
                               [remote]
                               nil)))))
 
+(defn- resolve-requests
+  [repo-system repo-session artifact-requests]
+  (try
+    (.resolveArtifacts repo-system repo-session artifact-requests)
+    (catch ArtifactResolutionException e
+      (.getResults e))))
+
 (defn resolve-runtime-artifacts
   "Resolves a list of runtime artifacts from the specified repository.
 
@@ -81,17 +92,19 @@
 
   :repositories      => [\"url-string locating the remote repository\" ...]
   :local-repository  => \"file path locating the local repository\"
+  :offline           => true or false
+  :include-sources   => true or false
 
   Returns:
 
-  {:root-node ^org.sonatype.aether.graph.DependencyNode
-     :files (seq of ^java.io.File)
+  {:files (seq of ^java.io.File)
      :classpath \"Platform specific classpath\"}
 "
   [artifacts & opts]
   (let [opts (merge {:repositories (default-remote-repositories)
                      :local-repository (default-local-repository)
-                     :offline false}
+                     :offline false
+                     :include-sources false}
                     (apply hash-map opts))
         repo-system (->
                      (doto (DefaultServiceLocator.)
@@ -100,10 +113,10 @@
                         (into-array
                          [(proxy [WagonProvider] []
                             (lookup [role-hint]
-                                    (condp = role-hint
-                                        "file" (FileWagon.)
-                                        "http" (LightweightHttpWagon.)
-                                        nil))
+                              (condp = role-hint
+                                "file" (FileWagon.)
+                                "http" (LightweightHttpWagon.)
+                                nil))
                             (release [wagon]))]))
                        (.addService
                         RepositoryConnectorFactory
@@ -118,31 +131,64 @@
                        (.setTransferListener (make-transfer-listener))
                        (.setRepositoryListener (make-repository-listener))
                        (.setOffline (:offline opts)))
-        generator (PreorderNodeListGenerator.)
-        root-node (doto (.getRoot
-                         (.collectDependencies
-                          repo-system
-                          repo-session
-                          (doto (CollectRequest.)
-                            (.setDependencies
-                             (for [[group-id artifact-id version] artifacts]
-                               (Dependency. (DefaultArtifact.
-                                              group-id
-                                              artifact-id
-                                              ""
-                                              "jar"
-                                              version)
-                                            "runtime")))
-                            (.setRepositories
-                             (for [[id location] (:repositories opts)]
-                               (RemoteRepository.
-                                id
-                                "default"
-                                location))))))
-                    (.accept generator))]
-    (.resolveDependencies repo-system repo-session root-node nil)
-    {:root-node root-node
-     :files (seq (.getFiles generator))
-     :classpath (.getClassPath generator)}))
+        repositories (for [[id location] (:repositories opts)]
+                       (RemoteRepository.
+                        id
+                        "default"
+                        location))
+        root-dependencies (for [[group-id artifact-id version] artifacts]
+                            (Dependency. (DefaultArtifact.
+                                           group-id
+                                           artifact-id
+                                           ""
+                                           "jar"
+                                           version)
+                                         "runtime"))
+        required-artifacts-result (.collectDependencies
+                                   repo-system
+                                   repo-session
+                                   (CollectRequest.
+                                    root-dependencies
+                                    nil
+                                    repositories))
+        [required-artifacts required-nodes] ((juxt #(.getArtifacts % true)
+                                                   #(.getNodes %))
+                                             (doto (PreorderNodeListGenerator.)
+                                               (->>
+                                                (.accept
+                                                 (.getRoot required-artifacts-result)))))
+        source-nodes (when (:include-sources opts)
+                       (let [source-dependencies (map #(Dependency.
+                                                        (SubArtifact. %1 "sources" "jar")
+                                                        "runtime"
+                                                        true)
+                                                      required-artifacts)]
+                         (.getNodes
+                          (doto (PreorderNodeListGenerator.)
+                            (->>
+                             (.accept
+                              (.getRoot
+                               (.collectDependencies
+                                repo-system
+                                repo-session
+                                (CollectRequest. source-dependencies nil repositories)))))))))
 
-
+        resolved-artifacts (filter
+                            #(.isResolved %)
+                            (resolve-requests
+                             repo-system
+                             repo-session
+                             (map #(ArtifactRequest. %)
+                                  (second
+                                   (reduce (fn [[seen result] node]
+                                             (let [dependency (.getDependency node)]
+                                               [(conj seen dependency)
+                                                (if (seen dependency)
+                                                  result
+                                                  (conj result node))]))
+                                           [#{} []]
+                                           (concat required-nodes source-nodes))))))
+        files (map #(.. % getArtifact getFile) resolved-artifacts)]
+    {:files files
+     :classpath (apply str (interpose java.io.File/pathSeparator
+                                      (map #(.getAbsolutePath %) files)))}))
